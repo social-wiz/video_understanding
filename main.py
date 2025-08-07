@@ -3,6 +3,7 @@ import time
 import uuid
 import secrets
 import re
+import google.generativeai as genai  # <-- THIS LINE WAS MISSING
 from fastapi import FastAPI, Request, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -20,6 +21,8 @@ try:
 
 except Exception as e:
     print(f"Error on startup: {e}")
+    # In case of a startup error, we should exit so the container restart loop is clear.
+    raise e
 
 # --- Security Dependency ---
 async def verify_api_key(x_api_key: Optional[str] = Header(None)):
@@ -40,7 +43,7 @@ MAX_FILE_SIZE_MB = 50
 MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
 
-# --- NEW: MODIFIED ENDPOINT TO STREAM LARGE FILES ---
+# --- Endpoint to Stream Large Files ---
 @app.post("/analyze/")
 async def analyze_video(request: Request):
     """
@@ -51,7 +54,7 @@ async def analyze_video(request: Request):
     if not content_type or 'multipart/form-data' not in content_type:
         raise HTTPException(status_code=400, detail="Invalid content type, please upload a form-data file.")
 
-    # --- Manually stream the file to disk ---
+    # Manually stream the file to disk
     file_name = f"{uuid.uuid4()}.mp4" # Default filename
     temp_file_path = f"/tmp/{file_name}"
     current_size = 0
@@ -67,18 +70,15 @@ async def analyze_video(request: Request):
                     )
                 buffer.write(chunk)
     except HTTPException as e:
-        # If we caught our own size limit error, re-raise it
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         raise e
     except Exception as e:
-        # Catch other streaming errors
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=f"Error streaming file: {str(e)}")
 
-
-    # --- The rest of the logic is the same ---
+    # The rest of the logic is the same
     gemini_file = None
     try:
         print(f"Uploading file '{file_name}' to Gemini API...")
