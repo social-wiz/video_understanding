@@ -1,108 +1,258 @@
 import os
 import time
-import uuid
-import secrets
-import re
-import google.generativeai as genai  # <-- THIS LINE WAS MISSING
-from fastapi import FastAPI, Request, HTTPException, Header, Depends
-from fastapi.responses import JSONResponse
+import tempfile
 from typing import Optional
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import google.generativeai as genai
+import logging
+from dotenv import load_dotenv
 
-# --- Configuration ---
-try:
-    GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-    if not GOOGLE_API_KEY:
-        raise ValueError("GOOGLE_API_KEY environment variable not set.")
-    genai.configure(api_key=GOOGLE_API_KEY)
+# Load environment variables from .env file
+load_dotenv()
 
-    API_KEY = os.getenv("MY_API_KEY")
-    if not API_KEY:
-        raise ValueError("MY_API_KEY environment variable for securing the API is not set.")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-except Exception as e:
-    print(f"Error on startup: {e}")
-    # In case of a startup error, we should exit so the container restart loop is clear.
-    raise e
-
-# --- Security Dependency ---
-async def verify_api_key(x_api_key: Optional[str] = Header(None)):
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="X-API-Key header is missing")
-    if not secrets.compare_digest(x_api_key, API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid API Key")
-
-# --- App Initialization ---
+# Initialize FastAPI app
 app = FastAPI(
-    title="Video Analysis API",
-    description="An API to analyze video content using Gemini 1.5 Flash.",
-    dependencies=[Depends(verify_api_key)]
+    title="Video Description API",
+    description="API for transcribing videos and providing visual descriptions with timestamps using Google's Gemini AI",
+    version="1.0.0"
 )
 
-# Define File Size Limit & Model
-MAX_FILE_SIZE_MB = 50
-MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
-model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
+# Configuration
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+SUPPORTED_VIDEO_TYPES = [
+    "video/mp4", "video/mpeg", "video/mov", "video/avi", 
+    "video/x-flv", "video/mpg", "video/webm", "video/wmv", "video/3gpp"
+]
 
-# --- Endpoint to Stream Large Files ---
-@app.post("/analyze/")
-async def analyze_video(request: Request):
+# Default prompt for video description
+DEFAULT_PROMPT = "Transcribe the audio from this video, giving timestamps for salient events in the video. Also provide visual descriptions."
+
+# Get API key from environment variable
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+MY_API_KEY = os.getenv("MY_API_KEY")
+
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable is required")
+
+if not MY_API_KEY:
+    raise ValueError("MY_API_KEY environment variable is required")
+
+# Configure Google Generative AI
+genai.configure(api_key=GOOGLE_API_KEY)
+
+# Pydantic models
+class YouTubeRequest(BaseModel):
+    youtube_url: str
+
+class VideoDescriptionResponse(BaseModel):
+    success: bool
+    description: str
+    processing_time: float
+    file_name: str
+
+# Dependency for API key verification
+async def verify_api_key(x_api_key: str = Header(None)):
+    if not x_api_key or x_api_key != MY_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key. Please provide a valid X-API-Key header."
+        )
+    return x_api_key
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Video Description API",
+        "version": "1.0.0",
+        "status": "running",
+        "description": "Transcribe videos and provide visual descriptions with timestamps"
+    }
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+@app.post("/describe-video", response_model=VideoDescriptionResponse)
+async def describe_video(
+    file: UploadFile = File(...),
+    api_key: str = Depends(verify_api_key)
+):
     """
-    Accepts a video file as a stream to handle large uploads,
-    and returns a textual analysis.
+    Transcribe video audio and provide visual descriptions with timestamps.
+    
+    This endpoint processes videos to:
+    - Transcribe the audio content
+    - Provide visual descriptions of what's happening
+    - Include timestamps for salient events
+    - Sample video at 1 frame per second
+    
+    - **file**: Video file to describe (max 50MB)
     """
-    content_type = request.headers.get('content-type')
-    if not content_type or 'multipart/form-data' not in content_type:
-        raise HTTPException(status_code=400, detail="Invalid content type, please upload a form-data file.")
-
-    # Manually stream the file to disk
-    file_name = f"{uuid.uuid4()}.mp4" # Default filename
-    temp_file_path = f"/tmp/{file_name}"
-    current_size = 0
-
+    
+    start_time = time.time()
+    
+    # Validate file type
+    if file.content_type not in SUPPORTED_VIDEO_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type. Supported types: {', '.join(SUPPORTED_VIDEO_TYPES)}"
+        )
+    
+    # Check file size
+    file_size = 0
+    content = await file.read()
+    file_size = len(content)
+    
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB"
+        )
+    
     try:
-        with open(temp_file_path, "wb") as buffer:
-            async for chunk in request.stream():
-                current_size += len(chunk)
-                if current_size > MAX_FILE_SIZE:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"File size exceeds the application limit of {MAX_FILE_SIZE_MB} MB."
-                    )
-                buffer.write(chunk)
-    except HTTPException as e:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        raise e
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file.filename.split('.')[-1]}") as temp_file:
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        logger.info(f"Processing video for description: {file.filename} ({file_size} bytes)")
+        
+        # Check if file is small enough for inline processing (< 20MB)
+        if file_size < 20 * 1024 * 1024:
+            # Use inline processing for smaller files
+            logger.info("Using inline video processing for description")
+            
+            # Create content parts for inline processing
+            parts = [
+                {
+                    "inline_data": {
+                        "data": content,
+                        "mime_type": file.content_type
+                    }
+                },
+                {
+                    "text": DEFAULT_PROMPT
+                }
+            ]
+            
+            # Generate content
+            model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
+            response = model.generate_content(
+                parts,
+                request_options={'timeout': 600}
+            )
+            
+            description_result = response.text
+            
+        else:
+            # Use File API for larger files
+            logger.info("Using File API for video description processing")
+            
+            # Upload file to Gemini API
+            video_file = genai.upload_file(path=temp_file_path)
+            logger.info(f"Uploaded file: {video_file.uri}")
+            
+            # Wait for processing
+            while video_file.state.name == "PROCESSING":
+                logger.info("Waiting for video to be processed...")
+                time.sleep(10)
+                video_file = genai.get_file(video_file.name)
+            
+            if video_file.state.name == "FAILED":
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Video processing failed: {video_file.state}"
+                )
+            
+            logger.info("Video processing complete!")
+            
+            # Generate description
+            model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
+            response = model.generate_content(
+                [DEFAULT_PROMPT, video_file],
+                request_options={'timeout': 600}
+            )
+            
+            description_result = response.text
+            
+            # Clean up uploaded file
+            genai.delete_file(video_file.name)
+            logger.info(f"Deleted file '{video_file.name}' from API")
+        
+        # Clean up temporary file
+        os.unlink(temp_file_path)
+        
+        processing_time = time.time() - start_time
+        
+        return VideoDescriptionResponse(
+            success=True,
+            description=description_result,
+            processing_time=processing_time,
+            file_name=file.filename
+        )
+        
     except Exception as e:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        raise HTTPException(status_code=500, detail=f"Error streaming file: {str(e)}")
+        logger.error(f"Error processing video description: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing video description: {str(e)}"
+        )
 
-    # The rest of the logic is the same
-    gemini_file = None
+@app.post("/describe-youtube")
+async def describe_youtube(
+    request: YouTubeRequest,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Transcribe YouTube video audio and provide visual descriptions with timestamps.
+    
+    - **youtube_url**: YouTube video URL (sent in request body as JSON)
+    """
+    
+    start_time = time.time()
+    
     try:
-        print(f"Uploading file '{file_name}' to Gemini API...")
-        gemini_file = genai.upload_file(path=temp_file_path)
+        # Create content parts for YouTube processing
+        parts = [
+            {
+                "file_data": {
+                    "file_uri": request.youtube_url
+                }
+            },
+            {
+                "text": DEFAULT_PROMPT
+            }
+        ]
         
-        while gemini_file.state.name == "PROCESSING":
-            print("Waiting for video to be processed...")
-            time.sleep(10)
-            gemini_file = genai.get_file(gemini_file.name)
-
-        if gemini_file.state.name == "FAILED":
-            raise HTTPException(status_code=500, detail=f"Gemini API video processing failed.")
+        # Generate content
+        model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
+        response = model.generate_content(
+            parts,
+            request_options={'timeout': 600}
+        )
         
-        print("Video processing complete.")
-        prompt = "Transcribe the audio from this video, giving timestamps for salient events. Also provide detailed visual descriptions of what is happening throughout the video."
-        response = model.generate_content([prompt, gemini_file], request_options={'timeout': 600})
-        return JSONResponse(content={"analysis": response.text})
-
+        processing_time = time.time() - start_time
+        
+        return {
+            "success": True,
+            "description": response.text,
+            "processing_time": processing_time,
+            "youtube_url": request.youtube_url
+        }
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-        
-    finally:
-        # Clean up files
-        if gemini_file:
-            genai.delete_file(gemini_file.name)
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+        logger.error(f"Error processing YouTube video description: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing YouTube video description: {str(e)}"
+        )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
