@@ -56,7 +56,7 @@ CLOUDFLARE_CUSTOMER_CODE = os.getenv("CLOUDFLARE_CUSTOMER_CODE")  # e.g., "loq77
 
 # Note: Cloudflare credentials are optional for basic functionality
 # but required for the /describe-cloudflare-video endpoint
-if not CLOUDLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_CUSTOMER_CODE:
+if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_CUSTOMER_CODE:
     logger.warning("Cloudflare credentials not fully configured. /describe-cloudflare-video endpoint will not work.")
     logger.warning("Set CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_CUSTOMER_CODE for Cloudflare Stream support.")
 
