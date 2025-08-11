@@ -340,6 +340,7 @@ async def describe_cloudflare_video(
                     "pendingupload": "Video upload is pending",
                     "downloading": "Video is being downloaded from source",
                     "encoding": "Video is being encoded and processed",
+                    "inprogress": "Video is being processed (uploading/encoding)",
                     "ready": "Video is ready for processing",
                     "error": "Video processing failed",
                     "uploading": "Video is being uploaded",
@@ -378,7 +379,7 @@ async def describe_cloudflare_video(
                                     status_code=400,
                                     detail=f"Video processing failed with state: {current_state} - {error_details}"
                                 )
-                            elif current_state in ["pendingupload", "downloading", "encoding", "uploading", "queued"]:
+                            elif current_state in ["pendingupload", "downloading", "encoding", "uploading", "queued", "inprogress"]:
                                 # These are normal processing states, continue waiting
                                 logger.info(f"Video is still processing: {state_descriptions.get(current_state, current_state)}")
                             else:
@@ -606,18 +607,24 @@ async def describe_cloudflare_video(
                 
             except Exception as e:
                 logger.error(f"Error processing video with Gemini AI: {str(e)}")
+                logger.error(f"Error type: {type(e).__name__}")
+                logger.error(f"Error details: {e}")
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Error processing video with Gemini AI: {str(e)}"
+                    detail=f"Error processing video with Gemini AI: {type(e).__name__}: {str(e)}"
                 )
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error processing Cloudflare video description: {str(e)}")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error details: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error processing Cloudflare video description: {str(e)}"
+            detail=f"Error processing Cloudflare video description: {type(e).__name__}: {str(e)}"
         )
 
 if __name__ == "__main__":
